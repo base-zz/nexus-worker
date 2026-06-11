@@ -22,23 +22,130 @@ VPS_DB_PATH = os.environ['VPS_DB_PATH']
 SSH_TIMEOUT = int(os.environ['SSH_TIMEOUT'])
 MAX_BATCH_SIZE = int(os.environ['SYNC_MAX_BATCH'])
 VALID_TABLES = {"pricing_logs", "fuel_logs", "marinas", "sync_events", "extractions"}
+APPEND_ONLY_TABLES = {"pricing_logs", "fuel_logs", "sync_events", "extractions"}
 
 # Redis connection pool
 pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 r = redis.Redis(connection_pool=pool)
 
+def _build_marina_upsert(data_dict: dict) -> str:
+    """Idempotent UPDATE-then-INSERT for marinas table.
+
+    Only overwrites existing VPS data if the incoming payload has a
+    newer updated_at_utc. Falls back to INSERT OR IGNORE for new records.
+    """
+    marina_uid = data_dict.get("marina_uid")
+    if not marina_uid:
+        raise ValueError("marinas sync payload missing marina_uid")
+
+    uid_escaped = str(marina_uid).replace("'", "''")
+    incoming_ts = str(data_dict.get("updated_at_utc", "")).replace("'", "''")
+
+    # Build SET clause for UPDATE and cols/vals for INSERT
+    set_parts: list[str] = []
+    insert_cols = ["marina_uid"]
+    insert_vals = [f"'{uid_escaped}'"]
+
+    for col, val in data_dict.items():
+        if col == "marina_uid":
+            continue
+        if val is None:
+            set_parts.append(f"{col} = NULL")
+            insert_vals.append("NULL")
+        elif isinstance(val, (int, float)):
+            set_parts.append(f"{col} = {val}")
+            insert_vals.append(str(val))
+        else:
+            escaped = str(val).replace("'", "''")
+            set_parts.append(f"{col} = '{escaped}'")
+            insert_vals.append(f"'{escaped}'")
+        insert_cols.append(col)
+
+    set_clause = ", ".join(set_parts)
+    ts_guard = (
+        f"AND (updated_at_utc IS NULL OR updated_at_utc < '{incoming_ts}')"
+        if incoming_ts
+        else ""
+    )
+
+    return (
+        f"BEGIN IMMEDIATE; "
+        f"UPDATE marinas SET {set_clause} "
+        f"WHERE marina_uid = '{uid_escaped}' {ts_guard}; "
+        f"INSERT OR IGNORE INTO marinas ({', '.join(insert_cols)}) "
+        f"VALUES ({', '.join(insert_vals)}); "
+        f"COMMIT;"
+    )
+
+
+def _build_sync_event_sql(
+    data_dict: dict,
+    target_table: str,
+    fetch_method: str,
+) -> str:
+    """Build an append-only sync_events audit record for a successful sync."""
+    marina_uid = str(data_dict.get("marina_uid", "")).replace("'", "''")
+    after_hash = str(data_dict.get("extraction_hash", "")).replace("'", "''")
+    method = str(fetch_method).replace("'", "''")
+
+    entity_type = {
+        "pricing_logs": "pricing_log",
+        "fuel_logs": "fuel_log",
+        "marinas": "marina",
+        "extractions": "extraction",
+        "sync_events": "sync_event",
+    }.get(target_table, "unknown")
+
+    return (
+        f"INSERT INTO sync_events ("
+        f"marina_uid, entity_type, entity_ref, event_type, reason_tag, "
+        f"after_hash, sync_dirty_before, sync_dirty_after, "
+        f"master_acknowledged, occurred_at_utc, fetch_method"
+        f") VALUES ("
+        f"'{marina_uid}', '{entity_type}', '{marina_uid}', 'data_synced', "
+        f"'sync_worker_success', '{after_hash}', 1, 0, 0, "
+        f"datetime('now'), '{method}'"
+        f");"
+    )
+
+
 def build_secure_sql(table_name, data_dict):
     if table_name not in VALID_TABLES:
         raise ValueError(f"Security Alert: Unauthorized table: {table_name}")
-    
+
+    # Marinas: conditional upsert to prevent stale overwrites
+    if table_name == "marinas":
+        return _build_marina_upsert(data_dict)
+
+    # Append-only tables: INSERT with optional extraction_hash dedup
     cols, vals = [], []
     for col, val in data_dict.items():
         cols.append(col)
-        if val is None: vals.append("NULL")
-        elif isinstance(val, (int, float)): vals.append(str(val))
-        else: vals.append(f"'{str(val).replace("'", "''")}'")
-            
-    return f"BEGIN IMMEDIATE; INSERT INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(vals)}); COMMIT;"
+        if val is None:
+            vals.append("NULL")
+        elif isinstance(val, (int, float)):
+            vals.append(str(val))
+        else:
+            vals.append(f"'{str(val).replace(chr(39), chr(39)+chr(39))}'")
+
+    if table_name in APPEND_ONLY_TABLES and "extraction_hash" in data_dict:
+        hash_val = str(data_dict["extraction_hash"]).replace("'", "''")
+        marina_uid = str(data_dict.get("marina_uid", "")).replace("'", "''")
+        return (
+            f"BEGIN IMMEDIATE; "
+            f"INSERT INTO {table_name} ({', '.join(cols)}) "
+            f"SELECT {', '.join(vals)} "
+            f"WHERE NOT EXISTS ("
+            f"  SELECT 1 FROM {table_name} "
+            f"  WHERE marina_uid = '{marina_uid}' AND extraction_hash = '{hash_val}'"
+            f"); "
+            f"COMMIT;"
+        )
+
+    return (
+        f"BEGIN IMMEDIATE; INSERT INTO {table_name} ({', '.join(cols)}) "
+        f"VALUES ({', '.join(vals)}); COMMIT;"
+    )
 
 def execute_remote_batch(sql_statements):
     """Executes SQL statements via stdin pipe."""
@@ -70,7 +177,7 @@ def main():
     while True:
         try:
             # Atomic Move: Pull from outbound to processing
-            item = r.blmove(OUTBOUND_QUEUE, PROCESSING_QUEUE, 'RIGHT', 'LEFT', timeout=5)
+            item = r.blmove(OUTBOUND_QUEUE, PROCESSING_QUEUE, 5, 'RIGHT', 'LEFT')
             if not item: continue
             
             batch = [item]
@@ -83,17 +190,27 @@ def main():
             for raw in batch:
                 try:
                     p = json.loads(raw)
-                    if not isinstance(p, dict): raise TypeError("Payload not a dict")
-                    sql_statements.append(build_secure_sql(p['target_table'], p['data']))
+                    if not isinstance(p, dict):
+                        raise TypeError("Payload not a dict")
+                    target_table = p["target_table"]
+                    data = p["data"]
+                    fetch_method = p.get("fetch_method", "")
+
+                    # Target table SQL
+                    sql_statements.append(build_secure_sql(target_table, data))
+                    # Audit trail SQL
+                    sql_statements.append(
+                        _build_sync_event_sql(data, target_table, fetch_method)
+                    )
                     valid_items.append(raw)
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                     print(f"[!] Invalid payload format: {e}")
                     r.lpush(DLQ, raw)
-                    r.lrem(PROCESSING_QUEUE, 0, raw)
-            
+                    r.lrem(PROCESSING_QUEUE, 1, raw)
+
             if execute_remote_batch(sql_statements):
                 for item in valid_items:
-                    r.lrem(PROCESSING_QUEUE, 0, item)
+                    r.lrem(PROCESSING_QUEUE, 1, item)
                 print(f"[✔] Successfully synced {len(valid_items)} items.")
             else:
                 print("[!] Sync failed. Items remain in processing for retry.")
