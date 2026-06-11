@@ -149,6 +149,7 @@ class FuelExtraction(BaseModel):
     """Output payload for fuel extraction (what goes into fuel_logs)."""
 
     marina_uid: str
+    fetched_at_utc: str
     outcome_state: str
     reason_tag: str
     diesel_price: float | None = None
@@ -157,9 +158,13 @@ class FuelExtraction(BaseModel):
     last_updated: str | None = None
     source_url: str | None = None
     source_text: str | None = None
-    provenance: dict[str, Any] = Field(default_factory=dict)
-    fetched_at_utc: str
+    provenance_json: str | None = None
+    price_source: str
+    confidence: float
+    extraction_hash: str | None = None
+    sync_dirty: int = 1
     blocked_reason: str | None = None
+    created_at_utc: str | None = None
 
     @field_validator("outcome_state")
     @classmethod

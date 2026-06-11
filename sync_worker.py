@@ -52,9 +52,16 @@ def _build_marina_upsert(data_dict: dict) -> str:
         if val is None:
             set_parts.append(f"{col} = NULL")
             insert_vals.append("NULL")
+        elif isinstance(val, bool):
+            set_parts.append(f"{col} = {1 if val else 0}")
+            insert_vals.append("1" if val else "0")
         elif isinstance(val, (int, float)):
             set_parts.append(f"{col} = {val}")
             insert_vals.append(str(val))
+        elif isinstance(val, (list, dict)):
+            json_str = json.dumps(val).replace("'", "''")
+            set_parts.append(f"{col} = '{json_str}'")
+            insert_vals.append(f"'{json_str}'")
         else:
             escaped = str(val).replace("'", "''")
             set_parts.append(f"{col} = '{escaped}'")
@@ -69,12 +76,10 @@ def _build_marina_upsert(data_dict: dict) -> str:
     )
 
     return (
-        f"BEGIN IMMEDIATE; "
         f"UPDATE marinas SET {set_clause} "
         f"WHERE marina_uid = '{uid_escaped}' {ts_guard}; "
         f"INSERT OR IGNORE INTO marinas ({', '.join(insert_cols)}) "
-        f"VALUES ({', '.join(insert_vals)}); "
-        f"COMMIT;"
+        f"VALUES ({', '.join(insert_vals)});"
     )
 
 
@@ -123,8 +128,14 @@ def build_secure_sql(table_name, data_dict):
         cols.append(col)
         if val is None:
             vals.append("NULL")
+        elif isinstance(val, bool):
+            vals.append("1" if val else "0")
         elif isinstance(val, (int, float)):
             vals.append(str(val))
+        elif isinstance(val, (list, dict)):
+            # Properly serialize JSON fields (source_quotes, provenance_json, aliases_json, etc.)
+            json_str = json.dumps(val).replace("'", "''")
+            vals.append(f"'{json_str}'")
         else:
             vals.append(f"'{str(val).replace(chr(39), chr(39)+chr(39))}'")
 
@@ -132,23 +143,18 @@ def build_secure_sql(table_name, data_dict):
         hash_val = str(data_dict["extraction_hash"]).replace("'", "''")
         marina_uid = str(data_dict.get("marina_uid", "")).replace("'", "''")
         return (
-            f"BEGIN IMMEDIATE; "
             f"INSERT INTO {table_name} ({', '.join(cols)}) "
             f"SELECT {', '.join(vals)} "
             f"WHERE NOT EXISTS ("
             f"  SELECT 1 FROM {table_name} "
             f"  WHERE marina_uid = '{marina_uid}' AND extraction_hash = '{hash_val}'"
-            f"); "
-            f"COMMIT;"
+            f");"
         )
 
-    return (
-        f"BEGIN IMMEDIATE; INSERT INTO {table_name} ({', '.join(cols)}) "
-        f"VALUES ({', '.join(vals)}); COMMIT;"
-    )
+    return f"INSERT INTO {table_name} ({', '.join(cols)}) VALUES ({', '.join(vals)});"
 
 def execute_remote_batch(sql_statements):
-    """Executes SQL statements via stdin pipe."""
+    """Executes SQL statements via stdin pipe over SSH."""
     full_sql = "\n".join(sql_statements)
     cmd = ["ssh", "-o", "BatchMode=yes", f"{VPS_USER}@{VPS_IP}", "sqlite3", "-cmd", ".timeout 5000", VPS_DB_PATH]
     
@@ -196,11 +202,11 @@ def main():
                     data = p["data"]
                     fetch_method = p.get("fetch_method", "")
 
-                    # Target table SQL
-                    sql_statements.append(build_secure_sql(target_table, data))
-                    # Audit trail SQL
+                    data_sql = build_secure_sql(target_table, data)
+                    audit_sql = _build_sync_event_sql(data, target_table, fetch_method)
+                    # Wrap data + audit in one atomic transaction
                     sql_statements.append(
-                        _build_sync_event_sql(data, target_table, fetch_method)
+                        f"BEGIN IMMEDIATE; {data_sql} {audit_sql} COMMIT;"
                     )
                     valid_items.append(raw)
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:

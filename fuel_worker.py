@@ -158,9 +158,13 @@ def _build_output_from_dockwa(job_input: dict[str, Any], dockwa_result: dict[str
         "last_updated": dockwa_result.get("last_updated"),
         "source_url": source_url,
         "source_text": source_text,
-        "provenance": provenance,
+        "provenance_json": json.dumps(provenance) if provenance else None,
+        "price_source": "dockwa_json",
+        "confidence": 1.0,
         "fetched_at_utc": fetched_at_utc,
         "blocked_reason": None,
+        "sync_dirty": 1,
+        "created_at_utc": fetched_at_utc,
     }
 
 
@@ -315,6 +319,7 @@ def _build_output_payload(job_input: dict[str, Any], response: ExtractResponse) 
 
     price_source = _price_source(outcome_state, source_url)
     provenance = _build_provenance_payload(response, fetched_at_utc, price_source)
+    confidence = _normalize_confidence(response.extraction.confidence)
 
     return {
         "marina_uid": marina_uid,
@@ -326,9 +331,13 @@ def _build_output_payload(job_input: dict[str, Any], response: ExtractResponse) 
         "last_updated": response.extraction.last_updated,
         "source_url": source_url,
         "source_text": source_text,
-        "provenance": provenance,
+        "provenance_json": json.dumps(provenance) if provenance else None,
+        "price_source": price_source,
+        "confidence": confidence,
         "fetched_at_utc": fetched_at_utc,
         "blocked_reason": blocked_reason,
+        "sync_dirty": 1,
+        "created_at_utc": fetched_at_utc,
         "extraction_hash": _extraction_hash({
             "marina_uid": marina_uid,
             "outcome_state": outcome_state,
@@ -340,6 +349,8 @@ def _build_output_payload(job_input: dict[str, Any], response: ExtractResponse) 
             "last_updated": response.extraction.last_updated,
             "source_url": source_url,
             "source_text": source_text,
+            "price_source": price_source,
+            "confidence": confidence,
         }),
     }
 
